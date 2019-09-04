@@ -115,6 +115,9 @@ function parse_pkg_files(id::PkgId)
         cachefile, mods_files_mtimes = pkg_fileinfo(id)
         if cachefile !== nothing
             for (mod, fname, _) in mods_files_mtimes
+                if mod === Main && !isdefined(mod, modsym)  # issue #312
+                    mod = Base.root_module(PkgId(pkgdata))
+                end
                 fname = relpath(fname, pkgdata)
                 # For precompiled packages, we can read the source later (whenever we need it)
                 # from the *.ji cachefile.
@@ -228,18 +231,18 @@ end
 
 function watch_files_via_dir(dirname)
     wait_changed(dirname)  # this will block until there is a modification
-    latestfiles = String[]
+    latestfiles = Pair{String,PkgId}[]
     # Check to see if we're still watching this directory
     stillwatching = haskey(watched_files, dirname)
     if stillwatching
         wf = watched_files[dirname]
-        for file in wf.trackedfiles
+        for (file, id) in wf.trackedfiles
             fullpath = joinpath(dirname, file)
             if newer(mtime(fullpath), wf.timestamp)
-                push!(latestfiles, file)
+                push!(latestfiles, file=>id)
             end
         end
-        updatetime!(wf)
+        isempty(latestfiles) || updatetime!(wf)  # ref issue #341
     end
     return latestfiles, stillwatching
 end

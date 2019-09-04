@@ -559,6 +559,7 @@ end
         yry()
         @test li_f() == -1
         rm_precompile("LoopInclude")
+
         # Multiple packages in the same directory (issue #228)
         open(joinpath(testdir, "A228.jl"), "w") do io
             println(io, """
@@ -593,6 +594,49 @@ end
         @test f228(3) == 39
         rm_precompile("A228")
         rm_precompile("B228")
+
+        # uncoupled packages in the same directory (issue #339)
+        open(joinpath(testdir, "A339.jl"), "w") do io
+            println(io, """
+                        module A339
+                        f() = 1
+                        end
+                        """)
+        end
+        open(joinpath(testdir, "B339.jl"), "w") do io
+            println(io, """
+                        module B339
+                        f() = 1
+                        end
+                        """)
+        end
+        sleep(mtimedelay)
+        using A339, B339
+        sleep(mtimedelay)
+        @test A339.f() == 1
+        @test B339.f() == 1
+        open(joinpath(testdir, "A339.jl"), "w") do io
+            println(io, """
+                        module A339
+                        f() = 2
+                        end
+                        """)
+        end
+        yry()
+        @test A339.f() == 2
+        @test B339.f() == 1
+        open(joinpath(testdir, "B339.jl"), "w") do io
+            println(io, """
+                        module B339
+                        f() = 2
+                        end
+                        """)
+        end
+        yry()
+        @test A339.f() == 2
+        @test B339.f() == 2
+        rm_precompile("A339")
+        rm_precompile("B339")
 
         pop!(LOAD_PATH)
     end
@@ -1142,6 +1186,38 @@ end
         pop!(LOAD_PATH)
     end
 
+    @testset "Timing (issue #341)" begin
+        testdir = newtestdir()
+        dn = joinpath(testdir, "Timing", "src")
+        mkpath(dn)
+        open(joinpath(dn, "Timing.jl"), "w") do io
+            println(io, """
+            module Timing
+            f(x) = 1
+            end
+            """)
+        end
+        sleep(mtimedelay)
+        @eval using Timing
+        sleep(mtimedelay)
+        @test Timing.f(nothing) == 1
+        tmpfile = joinpath(dn, "Timing_temp.jl")
+        open(tmpfile, "w") do io
+            println(io, """
+            module Timing
+            f(x) = 2
+            end
+            """)
+        end
+        yry()
+        @test Timing.f(nothing) == 1
+        mv(tmpfile, pathof(Timing), force=true)
+        yry()
+        @test Timing.f(nothing) == 2
+
+        rm_precompile("Timing")
+    end
+
     @testset "Method deletion" begin
         Core.eval(Base, :(revisefoo(x::Float64) = 1)) # to test cross-module method scoping
         testdir = newtestdir()
@@ -1498,7 +1574,7 @@ revise_f(x) = 2
         sleep(mtimedelay)
         includet(srcfile)
         sleep(mtimedelay)
-        @test basename(srcfile) ∈ Revise.watched_files[dirname(srcfile)].trackedfiles
+        @test basename(srcfile) ∈ Revise.watched_files[dirname(srcfile)]
         push!(to_remove, srcfile)
 
         # Double-execution (issue #263)
