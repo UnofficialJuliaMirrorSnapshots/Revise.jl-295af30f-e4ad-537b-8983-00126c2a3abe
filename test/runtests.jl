@@ -182,7 +182,7 @@ k(x) = 4
         (def, val) = dvs[1]
         @test isequal(def, Revise.RelocatableExpr(:(square(x) = x^2)))
         @test val == [Tuple{typeof(ReviseTest.square),Any}]
-        @test Revise.firstline(def).line == 5
+        @test Revise.firstline(Revise.unwrap(def)).line == 5
         m = @which ReviseTest.square(1)
         @test m.line == 5
         @test whereis(m) == (tmpfile, 5)
@@ -207,7 +207,7 @@ k(x) = 4
         (def, val) = dvs[1]
         @test isequal(def,  Revise.RelocatableExpr(:(mult2(x) = 2*x)))
         @test val == [Tuple{typeof(ReviseTest.Internal.mult2),Any}]
-        @test Revise.firstline(def).line == 13
+        @test Revise.firstline(Revise.unwrap(def)).line == 13
         m = @which ReviseTest.Internal.mult2(1)
         @test m.line == 11
         @test whereis(m) == (tmpfile, 13)
@@ -659,6 +659,61 @@ end
             display(failedfiles)
         end
         @test isempty(failedfiles)
+    end
+
+    # issue #318
+    @testset "Cross-module extension" begin
+        testdir = newtestdir()
+        dnA = joinpath(testdir, "CrossModA", "src")
+        mkpath(dnA)
+        open(joinpath(dnA, "CrossModA.jl"), "w") do io
+            println(io, """
+            module CrossModA
+            foo(x) = "default"
+            end
+            """)
+        end
+        dnB = joinpath(testdir, "CrossModB", "src")
+        mkpath(dnB)
+        open(joinpath(dnB, "CrossModB.jl"), "w") do io
+            println(io, """
+            module CrossModB
+            import CrossModA
+            CrossModA.foo(x::Int) = 1
+            end
+            """)
+        end
+        sleep(mtimedelay)
+        @eval using CrossModA, CrossModB
+        @test CrossModA.foo("") == "default"
+        @test CrossModA.foo(0) == 1
+        sleep(mtimedelay)
+        open(joinpath(dnB, "CrossModB.jl"), "w") do io
+            println(io, """
+            module CrossModB
+            import CrossModA
+            CrossModA.foo(x::Int) = 2
+            end
+            """)
+        end
+        yry()
+        @test CrossModA.foo("") == "default"
+        @test CrossModA.foo(0) == 2
+        open(joinpath(dnB, "CrossModB.jl"), "w") do io
+            println(io, """
+            module CrossModB
+            import CrossModA
+            CrossModA.foo(x::Int) = 3
+            end
+            """)
+        end
+        yry()
+        @test CrossModA.foo("") == "default"
+        @test CrossModA.foo(0) == 3
+
+        rm_precompile("CrossModA")
+        rm_precompile("CrossModB")
+        pop!(LOAD_PATH)
     end
 
     # issue #36
@@ -1463,6 +1518,33 @@ end
         @test occursin("T not defined", str)
 
         rm_precompile("RevisionErrors")
+
+        testfile = joinpath(testdir, "Test301.jl")
+        open(testfile, "w") do io
+            print(io, """
+            module Test301
+            mutable struct Struct301
+                x::Int
+                err
+
+                Struct301(x::Integer) = new(x)
+            end
+            f(s) = s.err
+            const s = Struct301(1)
+            f(s)
+            end
+            """)
+        end
+        logfile = joinpath(tempdir(), randtmp()*".log")
+        Test.collect_test_logs() do
+            open(logfile, "w") do io
+                redirect_stderr(io) do
+                    includet(testfile)
+                end
+            end
+        end
+        str = read(logfile, String)
+        @test occursin("Test301.jl:10", str)
     end
 
     @testset "get_def" begin
@@ -1477,6 +1559,9 @@ end
             f(v::AbstractVector) = 2
             f(v::AbstractVector{<:Integer}) = 3
 
+            foo(x::T, y::Integer=1; kw1="hello", kwargs...) where T<:Number = error("stop")
+            bar(x) = foo(x; kw1="world")
+
             end
             """)
         end
@@ -1490,6 +1575,11 @@ end
         ex = Revise.RelocatableExpr(definition(m))
         @test ex isa Revise.RelocatableExpr
         @test isequal(ex, Revise.RelocatableExpr(:(f(v::AbstractVector{<:Integer}) = 3)))
+
+        st = try GetDef.bar(5.0) catch err stacktrace(catch_backtrace()) end
+        m = st[2].linfo.def
+        def = Revise.RelocatableExpr(definition(m))
+        @test def == Revise.RelocatableExpr(:(foo(x::T, y::Integer=1; kw1="hello", kwargs...) where T<:Number = error("stop")))
 
         rm_precompile("GetDef")
 
@@ -1525,8 +1615,8 @@ end
         srcfile = joinpath(tempdir(), randtmp()*".jl")
         open(srcfile, "w") do io
             print(io, """
-revise_f(x) = 1
-""")
+            revise_f(x) = 1
+            """)
         end
         sleep(mtimedelay)
         includet(srcfile)
@@ -1535,8 +1625,8 @@ revise_f(x) = 1
         @test length(signatures_at(srcfile, 1)) == 1
         open(srcfile, "w") do io
             print(io, """
-revise_f(x) = 2
-""")
+            revise_f(x) = 2
+            """)
         end
         yry()
         @test revise_f(10) == 2
@@ -1548,18 +1638,18 @@ revise_f(x) = 2
         srcfile = randtmp()*".jl"
         open(srcfile, "w") do io
             print(io, """
-        revise_floc(x) = 1
-        """)
+            revise_floc(x) = 1
+            """)
         end
         sleep(mtimedelay)
         include(joinpath(pwd(), srcfile))
-        sleep(mtimedelay)
         @test revise_floc(10) == 1
         Revise.track(srcfile)
+        sleep(mtimedelay)
         open(srcfile, "w") do io
             print(io, """
-        revise_floc(x) = 2
-        """)
+            revise_floc(x) = 2
+            """)
         end
         yry()
         @test revise_floc(10) == 2
@@ -1634,6 +1724,54 @@ revise_f(x) = 2
         end
         yry()
         @test f264() == 2
+
+        # recursive `includet`s (issue #302)
+        testdir = newtestdir()
+        srcfile1 = joinpath(testdir, "Test302.jl")
+        open(srcfile1, "w") do io
+            print(io, """
+            module Test302
+            struct Parameters{T}
+                control::T
+            end
+            function Parameters(control = nothing; kw...)
+                Parameters(control)
+            end
+            function (p::Parameters)(; kw...)
+                p
+            end
+            end
+            """)
+        end
+        srcfile2 = joinpath(testdir, "test2.jl")
+        open(srcfile2, "w") do io
+            print(io, """
+            includet(joinpath(@__DIR__, "Test302.jl"))
+            using .Test302
+            """)
+        end
+        sleep(mtimedelay)
+        includet(srcfile2)
+        sleep(mtimedelay)
+        p = Test302.Parameters{Int}(3)
+        @test p() == p
+        open(srcfile1, "w") do io
+            print(io, """
+            module Test302
+            struct Parameters{T}
+                control::T
+            end
+            function Parameters(control = nothing; kw...)
+                Parameters(control)
+            end
+            function (p::Parameters)(; kw...)
+                0
+            end
+            end
+            """)
+        end
+        yry()
+        @test p() == 0
     end
 
     @testset "Auto-track user scripts" begin
@@ -1905,82 +2043,85 @@ end
             pop!(hp.history)
         end
     end
+end
 
-    @testset "Switching free/dev" begin
-        function make_a2d(path, val, mode="r")
-            # Create a new "read-only package" (which mimics how Pkg works when you `add` a package)
-            pkgpath = joinpath(path, "A2D")
-            srcpath = joinpath(pkgpath, "src")
-            mkpath(srcpath)
-            filepath = joinpath(srcpath, "A2D.jl")
-            open(filepath, "w") do io
-                println(io, """
-                        module A2D
-                        f() = $val
-                        end
-                        """)
-            end
-            chmod(filepath, mode=="r" ? 0o100444 : 0o100644)
-            return pkgpath
+@testset "Switching free/dev" begin
+    function make_a2d(path, val, mode="r")
+        # Create a new "read-only package" (which mimics how Pkg works when you `add` a package)
+        pkgpath = joinpath(path, "A2D")
+        srcpath = joinpath(pkgpath, "src")
+        mkpath(srcpath)
+        filepath = joinpath(srcpath, "A2D.jl")
+        open(filepath, "w") do io
+            println(io, """
+                    module A2D
+                    f() = $val
+                    end
+                    """)
         end
-        # Create a new package depot
-        depot = mktempdir()
-        old_depots = copy(DEPOT_PATH)
-        empty!(DEPOT_PATH)
-        push!(DEPOT_PATH, depot)
-        # Skip cloning the General registry since that is slow and unnecessary
-        registries = Pkg.Types.DEFAULT_REGISTRIES
-        old_registries = copy(registries)
-        empty!(registries)
-        # Ensure we start fresh with no dependencies
-        old_project = Base.ACTIVE_PROJECT[]
-        Base.ACTIVE_PROJECT[] = joinpath(depot, "environments", "v$(VERSION.major).$(VERSION.minor)", "Project.toml")
-        mkpath(dirname(Base.ACTIVE_PROJECT[]))
-        open(Base.ACTIVE_PROJECT[], "w") do io
-            println(io, "[deps]")
-        end
-        ropkgpath = make_a2d(depot, 1)
-        Pkg.REPLMode.do_cmd(Pkg.REPLMode.minirepl[], "dev $ropkgpath"; do_rethrow=true)  # like pkg> dev $pkgpath; unfortunately, Pkg.develop(pkgpath) doesn't work
-        sleep(mtimedelay)
-        @eval using A2D
-        sleep(mtimedelay)
-        @test Base.invokelatest(A2D.f) == 1
-        for dir in keys(Revise.watched_files)
-            @test !startswith(dir, ropkgpath)
-        end
-        devpath = joinpath(depot, "dev")
-        mkpath(devpath)
-        mfile = Revise.manifest_file()
-        schedule(Task(Revise.Rescheduler(Revise.watch_manifest, (mfile,))))
-        sleep(mtimedelay)
-        pkgdevpath = make_a2d(devpath, 2, "w")
-        Pkg.REPLMode.do_cmd(Pkg.REPLMode.minirepl[], "dev $pkgdevpath"; do_rethrow=true)
-        yry()
-        @test Base.invokelatest(A2D.f) == 2
-        Pkg.REPLMode.do_cmd(Pkg.REPLMode.minirepl[], "dev $ropkgpath"; do_rethrow=true)
-        yry()
-        @test Base.invokelatest(A2D.f) == 1
-        for dir in keys(Revise.watched_files)
-            @test !startswith(dir, ropkgpath)
-        end
-
-        # Restore internal Pkg data
-        empty!(DEPOT_PATH)
-        append!(DEPOT_PATH, old_depots)
-        for pr in old_registries
-            push!(registries, pr)
-        end
-        Base.ACTIVE_PROJECT[] = old_project
-
-        push!(to_remove, depot)
+        chmod(filepath, mode=="r" ? 0o100444 : 0o100644)
+        return pkgpath
+    end
+    # Create a new package depot
+    depot = mktempdir()
+    old_depots = copy(DEPOT_PATH)
+    empty!(DEPOT_PATH)
+    push!(DEPOT_PATH, depot)
+    # Skip cloning the General registry since that is slow and unnecessary
+    registries = Pkg.Types.DEFAULT_REGISTRIES
+    old_registries = copy(registries)
+    empty!(registries)
+    # Ensure we start fresh with no dependencies
+    old_project = Base.ACTIVE_PROJECT[]
+    Base.ACTIVE_PROJECT[] = joinpath(depot, "environments", "v$(VERSION.major).$(VERSION.minor)", "Project.toml")
+    mkpath(dirname(Base.ACTIVE_PROJECT[]))
+    open(Base.ACTIVE_PROJECT[], "w") do io
+        println(io, "[deps]")
+    end
+    ropkgpath = make_a2d(depot, 1)
+    Pkg.REPLMode.do_cmd(Pkg.REPLMode.minirepl[], "dev $ropkgpath"; do_rethrow=true)  # like pkg> dev $pkgpath; unfortunately, Pkg.develop(pkgpath) doesn't work
+    sleep(mtimedelay)
+    @eval using A2D
+    sleep(mtimedelay)
+    @test Base.invokelatest(A2D.f) == 1
+    for dir in keys(Revise.watched_files)
+        @test !startswith(dir, ropkgpath)
+    end
+    devpath = joinpath(depot, "dev")
+    mkpath(devpath)
+    mfile = Revise.manifest_file()
+    schedule(Task(Revise.Rescheduler(Revise.watch_manifest, (mfile,))))
+    sleep(mtimedelay)
+    pkgdevpath = make_a2d(devpath, 2, "w")
+    Pkg.REPLMode.do_cmd(Pkg.REPLMode.minirepl[], "dev $pkgdevpath"; do_rethrow=true)
+    yry()
+    @test Base.invokelatest(A2D.f) == 2
+    Pkg.REPLMode.do_cmd(Pkg.REPLMode.minirepl[], "dev $ropkgpath"; do_rethrow=true)
+    yry()
+    @test Base.invokelatest(A2D.f) == 1
+    for dir in keys(Revise.watched_files)
+        @test !startswith(dir, ropkgpath)
     end
 
-    @testset "entr" begin
+    # Restore internal Pkg data
+    empty!(DEPOT_PATH)
+    append!(DEPOT_PATH, old_depots)
+    for pr in old_registries
+        push!(registries, pr)
+    end
+    Base.ACTIVE_PROJECT[] = old_project
+
+    push!(to_remove, depot)
+end
+
+@testset "entr" begin
+    if !Sys.isapple()   # these tests are very flaky on OSX
         srcfile = joinpath(tempdir(), randtmp()*".jl")
         push!(to_remove, srcfile)
         open(srcfile, "w") do io
             println(io, "Core.eval(Main, :(__entr__ = 1))")
         end
+        sleep(mtimedelay)
         try
             @sync begin
                 @async begin
@@ -2019,36 +2160,37 @@ end
             @test err.error.msg == "stop"
         end
     end
+end
 
-    GC.gc(); GC.gc()
+println("beginning cleanup")
+GC.gc(); GC.gc()
 
-    @testset "Cleanup" begin
-        logs, _ = Test.collect_test_logs() do
-            warnfile = randtmp()
-            open(warnfile, "w") do io
-                redirect_stderr(io) do
-                    for name in to_remove
-                        try
-                            rm(name; force=true, recursive=true)
-                            deleteat!(LOAD_PATH, findall(LOAD_PATH .== name))
-                        catch
-                        end
+@testset "Cleanup" begin
+    logs, _ = Test.collect_test_logs() do
+        warnfile = randtmp()
+        open(warnfile, "w") do io
+            redirect_stderr(io) do
+                for name in to_remove
+                    try
+                        rm(name; force=true, recursive=true)
+                        deleteat!(LOAD_PATH, findall(LOAD_PATH .== name))
+                    catch
                     end
-                    try yry() catch end
                 end
+                try yry() catch end
             end
-            if !Sys.isapple()
-                @test occursin("is not an existing directory", read(warnfile, String))
-            end
-            rm(warnfile)
         end
+        if !Sys.isapple()
+            @test occursin("is not an existing directory", read(warnfile, String))
+        end
+        rm(warnfile)
     end
-
 end
 
 GC.gc(); GC.gc(); GC.gc()   # work-around for https://github.com/JuliaLang/julia/issues/28306
 
 @testset "Base signatures" begin
+    println("beginning signatures tests")
     # Using the extensive repository of code in Base as a testbed
     include("sigtest.jl")
 end
