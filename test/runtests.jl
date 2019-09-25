@@ -1507,6 +1507,26 @@ end
         @test startswith(rec.message, "Failed to revise")
         @test occursin("missing comma", rec.message)
 
+        logs, _ = Test.collect_test_logs() do
+            yry()
+        end
+        rec = logs[1]
+        @test startswith(rec.message, "Due to a previously reported error")
+        @test occursin("RevisionErrors.jl", rec.message)
+
+        open(joinpath(dn, "RevisionErrors.jl"), "w") do io
+            println(io, """
+            module RevisionErrors
+            f(x) = 2
+            end
+            """)
+        end
+        logs, _ = Test.collect_test_logs() do
+            yry()
+        end
+        @test isempty(logs)
+        @test RevisionErrors.f(0) == 2
+
         # Also test that it ends up being reported to the user (issue #281)
         open(joinpath(dn, "RevisionErrors.jl"), "w") do io
             println(io, """
@@ -1998,20 +2018,19 @@ end
         Revise.get_tracked_id(Core)   # just test that this doesn't error
 
         # Determine whether a git repo is available. Travis & Appveyor do not have this.
-        # FIXME restore these tests
-        # repo, path = Revise.git_repo(Revise.juliadir)
-        # if repo != nothing
-        #     # Tracking Core.Compiler
-        #     Revise.track(Core.Compiler)
-        #     id = Base.PkgId(Core.Compiler)
-        #     pkgdata = Revise.pkgdatas[id]
-        #     @test any(k->endswith(k, "compiler.jl"), Revise.srcfiles(pkgdata))
-        #     m = first(methods(Core.Compiler.typeinf_code))
-        #     @test definition(m) isa Expr
-        # else
-        #     @test_throws Revise.GitRepoException Revise.track(Core.Compiler)
-        #     @warn "skipping Core.Compiler tests due to lack of git repo"
-        # end
+        repo, path = Revise.git_repo(Revise.juliadir)
+        if repo != nothing
+            # Tracking Core.Compiler
+            Revise.track(Core.Compiler)
+            id = Base.PkgId(Core.Compiler)
+            pkgdata = Revise.pkgdatas[id]
+            @test any(k->endswith(k, "optimize.jl"), Revise.srcfiles(pkgdata))
+            m = first(methods(Core.Compiler.typeinf_code))
+            @test definition(m) isa Expr
+        else
+            @test_throws Revise.GitRepoException Revise.track(Core.Compiler)
+            @warn "skipping Core.Compiler tests due to lack of git repo"
+        end
     end
 
     @testset "CodeTracking #48" begin
