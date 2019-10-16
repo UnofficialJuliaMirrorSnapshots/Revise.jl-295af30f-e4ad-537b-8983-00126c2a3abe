@@ -1573,6 +1573,11 @@ end
         end
         str = read(logfile, String)
         @test occursin("Test301.jl:10", str)
+
+        @info "A BoundsError followed by a Warning is expected"
+        Revise.track("callee_error.jl"; define=true, always_rethrow=true)
+        m = @which CalleeError.foo(3.2f0)
+        @test whereis(m)[2] == 14
     end
 
     @testset "get_def" begin
@@ -2076,21 +2081,27 @@ end
 end
 
 @testset "Switching free/dev" begin
-    function make_a2d(path, val, mode="r")
+    function make_a2d(path, val, mode="r"; generate=true)
         # Create a new "read-only package" (which mimics how Pkg works when you `add` a package)
-        pkgpath = joinpath(path, "A2D")
-        srcpath = joinpath(pkgpath, "src")
-        mkpath(srcpath)
-        filepath = joinpath(srcpath, "A2D.jl")
-        open(filepath, "w") do io
-            println(io, """
-                    module A2D
-                    f() = $val
-                    end
-                    """)
+        cd(path) do
+            pkgpath = joinpath(path, "A2D")
+            srcpath = joinpath(pkgpath, "src")
+            if generate
+                Pkg.generate("A2D")
+            else
+                mkpath(srcpath)
+            end
+            filepath = joinpath(srcpath, "A2D.jl")
+            open(filepath, "w") do io
+                println(io, """
+                        module A2D
+                        f() = $val
+                        end
+                        """)
+            end
+            chmod(filepath, mode=="r" ? 0o100444 : 0o100644)
+            return pkgpath
         end
-        chmod(filepath, mode=="r" ? 0o100444 : 0o100644)
-        return pkgpath
     end
     # Create a new package depot
     depot = mktempdir()
@@ -2122,7 +2133,8 @@ end
     mfile = Revise.manifest_file()
     schedule(Task(Revise.Rescheduler(Revise.watch_manifest, (mfile,))))
     sleep(mtimedelay)
-    pkgdevpath = make_a2d(devpath, 2, "w")
+    pkgdevpath = make_a2d(devpath, 2, "w"; generate=false)
+    cp(joinpath(ropkgpath, "Project.toml"), joinpath(devpath, "A2D/Project.toml"))
     Pkg.REPLMode.do_cmd(Pkg.REPLMode.minirepl[], "dev $pkgdevpath"; do_rethrow=true)
     yry()
     @test Base.invokelatest(A2D.f) == 2
