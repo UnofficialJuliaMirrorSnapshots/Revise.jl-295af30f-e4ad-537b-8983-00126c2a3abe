@@ -1553,13 +1553,17 @@ end
             module Test301
             mutable struct Struct301
                 x::Int
-                err
+                unset
 
                 Struct301(x::Integer) = new(x)
             end
-            f(s) = s.err
+            f(s) = s.unset
             const s = Struct301(1)
-            f(s)
+            if f(s)
+                g() = 1
+            else
+                g() = 2
+            end
             end
             """)
         end
@@ -2156,6 +2160,113 @@ end
     push!(to_remove, depot)
 end
 
+@testset "Broken dependencies (issue #371)" begin
+    testdir = newtestdir()
+    srcdir = joinpath(testdir, "DepPkg371", "src")
+    filepath = joinpath(srcdir, "DepPkg371.jl")
+    cd(testdir) do
+        Pkg.generate("DepPkg371")
+        open(filepath, "w") do io
+            println(io, """
+            module DepPkg371
+            using OrderedCollections   # undeclared dependency
+            greet() = "Hello world!"
+            end
+            """)
+        end
+    end
+    sleep(mtimedelay)
+    @info "A warning about not having OrderedCollection in dependencies is expected"
+    @eval using DepPkg371
+    @test DepPkg371.greet() == "Hello world!"
+    sleep(mtimedelay)
+    open(filepath, "w") do io
+        println(io, """
+        module DepPkg371
+        using OrderedCollections   # undeclared dependency
+        greet() = "Hello again!"
+        end
+        """)
+    end
+    yry()
+    @test DepPkg371.greet() == "Hello again!"
+
+    rm_precompile("DepPkg371")
+    pop!(LOAD_PATH)
+end
+
+@testset "New files & Requires.jl" begin
+    # Issue #107
+    testdir = newtestdir()
+    dn = joinpath(testdir, "NewFile", "src")
+    mkpath(dn)
+    open(joinpath(dn, "NewFile.jl"), "w") do io
+        println(io, """
+            module NewFile
+            f() = 1
+            end
+            """)
+    end
+    sleep(mtimedelay)
+    @eval using NewFile
+    @test NewFile.f() == 1
+    @test_throws UndefVarError NewFile.g()
+    sleep(mtimedelay)
+    open(joinpath(dn, "g.jl"), "w") do io
+        println(io, "g() = 2")
+    end
+    open(joinpath(dn, "NewFile.jl"), "w") do io
+        println(io, """
+            module NewFile
+            include("g.jl")
+            f() = 1
+            end
+            """)
+    end
+    yry()
+    @test NewFile.f() == 1
+    @test NewFile.g() == 2
+
+    rm_precompile("NewFile")
+    pop!(LOAD_PATH)
+
+    # # https://discourse.julialang.org/t/revise-with-requires/19347
+    # dn = joinpath(testdir, "TrackRequires", "src")
+    # mkpath(dn)
+    # open(joinpath(dn, "TrackRequires.jl"), "w") do io
+    #     println(io, """
+    #     module TrackRequires
+    #     using Requires
+    #     function __init__()
+    #         @require EndpointRanges="340492b5-2a47-5f55-813d-aca7ddf97656" begin
+    #             export testfunc
+    #             include("testfile.jl")
+    #             @require Revise="295af30f-e4ad-537b-8983-00126c2a3abe" begin
+    #                 import .Revise
+    #                 # Revise.add_file(TrackRequires, "src/testfile.jl")
+    #             end
+    #         end
+    #     end
+    #     end # module
+    #     """)
+    # end
+    # open(joinpath(dn, "testfile.jl"), "w") do io
+    #     println(io, "testfunc() = 1")
+    # end
+    # sleep(2.1) # so the defining files are old enough not to trigger mtime criterion
+    # @eval using TrackRequires
+    # @test_throws UndefVarError TrackRequires.testfunc()
+    # @eval using EndpointRanges  # to trigger Requires
+    # sleep(0.1)
+    # @test TrackRequires.testfunc() == 1
+    # open(joinpath(dn, "testfile.jl"), "w") do io
+    #     println(io, "testfunc() = 2")
+    # end
+    # yry()
+    # @test_broken TrackRequires.testfunc() == 2
+    # rm_precompile("TrackRequires")
+end
+
 @testset "entr" begin
     if !Sys.isapple()   # these tests are very flaky on OSX
         srcfile = joinpath(tempdir(), randtmp()*".jl")
@@ -2277,6 +2388,8 @@ GC.gc(); GC.gc()
 end
 
 GC.gc(); GC.gc(); GC.gc()   # work-around for https://github.com/JuliaLang/julia/issues/28306
+
+include("backedges.jl")
 
 @testset "Base signatures" begin
     println("beginning signatures tests")

@@ -19,12 +19,45 @@ function assign_this!(frame, value)
 end
 
 # This defines the API needed to store signatures using methods_by_execution!
-# This default version is simple; there's a more involved one in Revise.jl that interacts
-# with CodeTracking.
+# This default version is simple; there's a more involved one in the file Revise.jl
+# that interacts with CodeTracking.
 const MethodInfo = IdDict{Type,LineNumberNode}
 add_signature!(methodinfo::MethodInfo, @nospecialize(sig), ln) = push!(methodinfo, sig=>ln)
 push_expr!(methodinfo::MethodInfo, mod::Module, ex::Expr) = methodinfo
 pop_expr!(methodinfo::MethodInfo) = methodinfo
+add_dependencies!(methodinfo::MethodInfo, be::BackEdges, src, chunks) = methodinfo
+add_includes!(methodinfo::MethodInfo, filename) = methodinfo
+
+function minimal_evaluation!(methodinfo, frame)
+    src = frame.framecode.src
+    be = BackEdges(src)
+    chunks = toplevel_chunks(be)
+    musteval = falses(length(src.code))
+    for chunk in chunks
+        if hastrackedexpr(frame.framecode.src, chunk)
+            musteval[chunk] .= true
+        end
+    end
+    # Conservatively, we need to step in to each Core.eval in case the expression defines a method.
+    hadeval = false
+    for id in eachindex(src.code)
+        stmt = src.code[id]
+        me = false
+        if isa(stmt, Expr)
+            if stmt.head == :call
+                f = stmt.args[1]
+                me |= f === :include
+                me |= JuliaInterpreter.hasarg(isequal(:eval), stmt.args)
+            end
+        end
+        if me
+            chunkid = findfirst(chunk->id∈chunk, chunks)
+            musteval[chunks[chunkid]] .= true
+        end
+    end
+    add_dependencies!(methodinfo, be, src, chunks)
+    return musteval
+end
 
 function methods_by_execution(mod::Module, ex::Expr; kwargs...)
     methodinfo = MethodInfo()
@@ -33,36 +66,60 @@ function methods_by_execution(mod::Module, ex::Expr; kwargs...)
     return methodinfo, docexprs
 end
 
-function methods_by_execution!(@nospecialize(recurse), methodinfo, docexprs, mod::Module, ex::Expr; always_rethrow=false, kwargs...)
-    # We have to turn off all active breakpoints, https://github.com/timholy/CodeTracking.jl/issues/27
-    bp_refs = JuliaInterpreter.breakpoints()
-    if eltype(bp_refs) !== JuliaInterpreter.BreakpointRef
-        bp_refs = JuliaInterpreter.BreakpointRef[]
-        foreach(bp -> append!(bp_refs, bp.instances), bp_refs)
-    end
-    active_bp_refs = filter(bp->bp[].isactive, bp_refs)
-    foreach(disable, active_bp_refs)
-    local ret
-    try
-        frame = prepare_thunk(mod, ex)
-        frame === nothing && return nothing
-        ret = methods_by_execution!(recurse, methodinfo, docexprs, frame; kwargs...)
-    catch err
-        (always_rethrow || isa(err, InterruptException)) && rethrow(err)
-        @error "evaluation error" mod ex exception=(err, catch_backtrace())
-        ret = nothing
-    finally
+function methods_by_execution!(@nospecialize(recurse), methodinfo, docexprs, mod::Module, ex::Expr; always_rethrow=false, define=true, kwargs...)
+    frame = prepare_thunk(mod, ex)
+    frame === nothing && return nothing
+    define || LoweredCodeUtils.rename_framemethods!(recurse, frame)
+    # Determine whether we need interpreted mode
+    musteval = minimal_evaluation!(methodinfo, frame)
+    if !any(musteval)
+        # We can evaluate the entire expression in compiled mode
+        if define
+            ret = try
+                Core.eval(mod, ex) # evaluate in compiled mode if we don't need to interpret
+            catch err
+                loc = location_string(whereis(frame)...)
+                @error "(compiled mode) evaluation error starting at $loc" mod ex exception=(err, trim_toplevel!(catch_backtrace()))
+                nothing
+            end
+        else
+            ret = nothing
+        end
+    else
+        # Use the interpreter
+        # We have to turn off all active breakpoints, https://github.com/timholy/CodeTracking.jl/issues/27
+        bp_refs = JuliaInterpreter.breakpoints()
+        if eltype(bp_refs) !== JuliaInterpreter.BreakpointRef
+            bp_refs = JuliaInterpreter.BreakpointRef[]
+            foreach(bp -> append!(bp_refs, bp.instances), bp_refs)
+        end
+        active_bp_refs = filter(bp->bp[].isactive, bp_refs)
+        foreach(disable, active_bp_refs)
+        ret = try
+            methods_by_execution!(recurse, methodinfo, docexprs, frame, musteval; define=define, kwargs...)
+        catch err
+            (always_rethrow || isa(err, InterruptException)) && rethrow(err)
+            loc = location_string(whereis(frame)...)
+            @error "evaluation error starting at $loc" mod ex exception=(err, trim_toplevel!(catch_backtrace()))
+            nothing
+        end
         foreach(enable, active_bp_refs)
     end
     return ret
 end
 
-function methods_by_execution!(@nospecialize(recurse), methodinfo, docexprs, frame; define=true, skip_include=true)
+function methods_by_execution!(@nospecialize(recurse), methodinfo, docexprs, frame, musteval; define=true, skip_include=true)
     mod = moduleof(frame)
+    modinclude = getfield(mod, :include)  # hoist this lookup for performance
     signatures = []  # temporary for method signature storage
     pc = frame.pc
     while true
         JuliaInterpreter.is_leaf(frame) || (@warn("not a leaf"); break)
+        if !musteval[pc] && !define
+            pc = next_or_nothing!(frame)
+            pc === nothing && break
+            continue
+        end
         stmt = pc_expr(frame, pc)
         if isa(stmt, Expr)
             if stmt.head == :struct_type || stmt.head == :abstract_type || stmt.head == :primitive_type
@@ -155,14 +212,17 @@ function methods_by_execution!(@nospecialize(recurse), methodinfo, docexprs, fra
                         newex = unwrap(newex)
                         newframe = prepare_thunk(newmod, newex)
                         newframe === nothing && continue
+                        define || LoweredCodeUtils.rename_framemethods!(recurse, newframe)
+                        newmusteval = minimal_evaluation!(methodinfo, newframe)
                         push_expr!(methodinfo, newmod, newex)
-                        value = methods_by_execution!(recurse, methodinfo, docexprs, newframe; define=define)
+                        value = methods_by_execution!(recurse, methodinfo, docexprs, newframe, newmusteval; define=define)
                         pop_expr!(methodinfo)
                     end
                     assign_this!(frame, value)
                     pc = next_or_nothing!(frame)
-                elseif skip_include && (f === getfield(mod, :include) || f === Base.include || f === Core.include)
+                elseif skip_include && (f === modinclude || f === Base.include || f === Core.include)
                     # Skip include calls, otherwise we load new code
+                    add_includes!(methodinfo, @lookup(frame, stmt.args[2]))
                     assign_this!(frame, nothing)  # FIXME: the file might return something different from `nothing`
                     pc = next_or_nothing!(frame)
                 elseif !define && f === Base.Docs.doc!
@@ -227,5 +287,5 @@ function methods_by_execution!(@nospecialize(recurse), methodinfo, docexprs, fra
         end
         pc === nothing && break
     end
-    return get_return(frame)
+    return musteval[frame.pc] ? get_return(frame) : nothing
 end
